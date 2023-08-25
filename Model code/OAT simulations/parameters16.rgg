@@ -1,0 +1,97 @@
+import static parameters.*;
+
+/* Common bean (Phaseolus Vulgaris) can have both determinate (bush or semi-climber) or indeterminate (semi-climber climbing) growth habits. Here, only determinate bush or indeterminate climber can be selected. */
+{
+	// field parameters
+	nrRows[commonbean] = 1;                  // number of rows
+	nrPlants[commonbean] = 2;                // number of plants in a row
+	rowDistance[commonbean] = 0.5;//0.01;          // distance between rows
+	plantDistance[commonbean] = 0.5;        // distance between plants in a row
+	delay[commonbean] = 0;//10;                   // germination delay after start of simulation (in days, to represent late sowing)
+	harvest[commonbean] = 100;               // duration, i.e. harvest/removal time after emergence (in days)
+	hexa[commonbean] = false;                // true: hexagonal layout, rectangular otherwise
+	offspotIntraRow[commonbean] = 0.05;			// fraction of plant distance the plant seed is off-spot
+	offspotInterRow[commonbean] = 0.05;			// fraction of row distance the plant seed is off-spot
+	                                    
+	// plant parameters                 
+	determinate[commonbean] = false;		// TRUE = determinate, FALSE = indeterminate TODO: True should result in bush, while false should result in climber. 
+	plastochron[commonbean] = 60;           // time between creation of two phytomers (dd)
+	phyllochron[commonbean] = 60;			// time between appearance of two leaves (dd)
+	finalPhytNum[commonbean] = determinate[commonbean]?10:1;        	// final number of main stem vegetative phytomers
+	nrShortInternodes[commonbean] = 0;      // number of bottom internodes that should not elongate 
+                                        
+	wmaxRoot[commonbean] = 9000;            // maximum root system biomass
+	wmaxFlower[commonbean] = 2000;         	// maximum flower/fruit biomass (gokje based on https://scialert.net/fulltext/?doi=ijb.2010.323.333)
+	wmaxInt[commonbean] = 600;//300;              // maximum internode biomass (1200 (slecht?) gokje based on https://scialert.net/fulltext/?doi=ijb.2010.323.333)
+	wmaxLeaf[commonbean] = 2000;            // maximum leaf biomass (gokje based on https://scialert.net/fulltext/?doi=ijb.2010.323.333)
+	teRoot[commonbean] = 1800;               // root growth duration (dd)
+	teFlower[commonbean] = 250;              // flower/fruit growth duration
+	teInt[commonbean] = 250;                 // internode growth duration
+	teLeaf[commonbean] = 250;                // leaf growth duration
+
+	maxWidthInt[commonbean] = determinate[commonbean]?0.006:0.002;				// maxium internode width (determinate gokje based on https://scialert.net/fulltext/?doi=ijb.2010.323.333)
+	specificInternodeLength[commonbean] = determinate[commonbean]?0.020:0.10;  	// internode ratio length / biomass (mm/mg)
+
+	amax[commonbean] = 35;                   	// max photosynthesis rate
+	eff[commonbean] = 0.06;                  	// initial light use efficiency (initial slope of light response curve)
+	C4[commonbean] = false;						// false: C3, true: C4 (parameter only valid when FvCB is true)
+	nitro[commonbean] = 5;//2.5;					// nitrogen content of leaves at top of canopy (g/m2 of leaf)
+	
+	LMA[commonbean] = 19;                     	// leaf mass per unit area (mg / cm2) (19 = gokje based on https://scialert.net/fulltext/?doi=ijb.2010.323.333)
+	leafLife[commonbean] = 500;                	// life span of a leaf since appearance (expressed as X times its growth duration (te))
+	lwRatio[commonbean] = 1.4;                 	// ratio between leaf blade length and width
+	maxWidth[commonbean] = .8;             		// location on the leaf where width is maximal (fraction of length)
+	shapeCoeff[commonbean] = .5;            	// leaf shape coefficient (0 = rectangular, high value = pinched)
+	leafCurve[commonbean] = 30;              	// leaf curvature - angle between bottom and top of leaf blade (0 = flat)
+
+	rankLower[commonbean] = 1;				// final phtyomer that has properties of lower phytomers (e.g. nr of leaflets, leaf angle, etc) 
+
+	leafAngleLower[commonbean] = 90;		// insertion angle of lower leaves (90 = horizontal)
+	leafAngleUpper[commonbean] = 90;		// insertion angle of upper leaves (90 = horizontal)
+	
+	nrLeafletsLower[commonbean] = 1;				 // number of leaflets per leaf for the lower phytomers
+	nrLeafletsUpper[commonbean] = 3;				 // number of leaflets per leaf for the upper phytomers
+	petioleFraction[commonbean] = 0.15;		 	// fraction of biomass partitioned to the petiole
+	petioluleFraction[commonbean] = 0.1;	 	// fraction of biomass partitioned to the petiolule
+	specificPetioleLength[commonbean] = 0.9; 	// specific petiole length (mm/mg)
+	specificPetioluleLength[commonbean] = 1;	// specific petiolule length (mm/mg)
+	
+	nrLeavesLower[commonbean] = 2;			// number of leaves per phytomer for the lower phytomers
+	nrLeavesUpper[commonbean] = 1;			// number of leaves per phytomer for the upper phytomers
+	phyllotaxisLower[commonbean] = 180;           // angle between consecutive leaves along a stem for the lower phytomers
+	phyllotaxisUpper[commonbean] = 137;           // angle between consecutive leaves along a stem for the upper phytomers TODO: 180 degrees, but stem twists, so effectively it will be <180.
+	
+	varDelay[commonbean] = 0;                // max variation in germination delay (in days, 0 = simultaneous germination)
+	seedMass[commonbean] = 150;             // seed endosperm mass in mg (150-1000 g per 1000 seeds, i.e. **to do**)
+	
+	SASextend[commonbean] = true;				// toggle internode SAS extention response
+	
+	branching[commonbean] = true;			 // toggle branching TO DO: if climbing, is there branching? If not, can use "determinate[commonbean]" as boolean.
+	tillersOnly[commonbean] = false;		// true: bud break only if parent internode has length 0 (= tillering)
+	dominance[commonbean] = determinate[commonbean]?1:0;				// minimum dominance, so maximal branching phytomer distance, at infinitely large source/sink ratio (no neighbours) // toggle dominance TO DO: if climbing, there is less branching? So can use "determinate[commonbean]" as boolean to give different values to dominance.
+	srAbortThresh[commonbean] = 0;			// threshold sink/source ratio for branch abortion
+	
+	tb[commonbean] = 4;						// base temperature for thermal time calculation
+                  
+	// Root parameters
+	EL[commonbean] = 51; 					// Root elongation rate mm mm-1 day-1 
+	Dinit[commonbean] = 0.0011;				// Initial root Diameter in m (Pages 2013 - pea)
+	RTD[commonbean]	= 200;					// Root tissue density (g/cm3) (Pages 2013 - generic)
+	MP[commonbean] = 0;						// Maximum number of root primordia (Pages 2013 - pea)
+	ER[commonbean] = 0.056;					// Emergence rate of root primordia per day = 0.968 at 25 degrees which is 0.056 per dregreeday. (Pages 2013 - pea)
+	IBD[commonbean] = 0.0078;				// Inter Branch Distance (Pages 2013 - pea)
+	IBDmax[commonbean] = 0.039; 			// Inter branch distance of the highest root order (Pages 2013 - pea)
+	RZone[commonbean] = 0.01;				// No lateral zone in m 
+	RDM0[commonbean] = 0.5;					// Ratio Daughter Mother Diameter 
+	RDM1[commonbean] = 0.375;					// Ratio Daughter Mother Diameter 
+	sdD[commonbean] = 0.09;					// Standard deviation diameter for RDM (Pages 2013 - pea)
+	angleAVG[commonbean] = 60;				// average insertion angle of lateral roots
+	angleVAR[commonbean] = 20;				// variation in the insertion angle of lateral roots
+	MCP[commonbean]	= 5;					//random root movement based on mechanical constraints; radial degrees/m
+	MaxRootOrder[commonbean] = 1;
+	fineRootD[commonbean] = 0.1;			// Diameter in m/m
+	fineRootDensity[commonbean]	= 32;		// m fine roots/m coarse root	
+	RLratio[commonbean]	= 1;	 			// Root/Leaf ratio //1
+	fMyc[commonbean] = 0;					// +MF 0.00005
+	Groot[commonbean] = 0.01;				// Base rate of Gravitropism 
+} 

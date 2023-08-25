@@ -1,0 +1,403 @@
+import static parameters.*;
+import static modules_base.*;
+import static modules_organs.*;
+import static modules_light.*;
+import static SimpleSoilModule.*;
+import static RootModule.*;
+import de.grogra.rgg.AvoidIntersection;	
+import de.grogra.ray2.radiosity.Vector3d;
+
+/* Specific Milpa-modules and methods, e.g. 
+	- simpler dormancy-update for bean,
+	- avoid-intersection methods for bean/maize, 
+	- bending of bean stem around virtual pole/maize stalk, 
+	- drying of bean/maize 
+	- folding of maize stalk 
+*/
+
+/* List of things in other files:
+	- Some milpa parameters are in parameter.rgg
+	- Field layout in initiation.rgg
+*/
+
+// Milpa specific parameters
+static int maizeFoldDay 	=	40;		// Number of days after emergence that farmer folds maize stems
+static int maizeFoldRank	=	9;		// Height at which maize stalk is folded (in internode number)
+
+	//avoidIntersection parameters for bean and squash
+const int 		numRaysBean		 			= beanPole?500:100;				// Number of rays (default = 100)		
+const double	lengthRaysBean				= .2;				// Length of test rays											
+const boolean	showRaysBean				= true;				// True = show test rays in 3D view	
+const double	openWidthAngleBean			= 1;				// Width of the test space			
+const double	openHeightAngleBean			= 1;			// Heigth of the test space							
+const double 	predictedLengthBean			= 0.1;				// Length of translation of ray origins along the current heading	TODO make function of previous internode length or smth?
+const double	strengthOfChangeBean		= 1;				// Strength of direction change	
+const double	dist2SurfBean				= 0.02;				// Minimal distance of apex to favorNodes
+const double 	a_helix 					= 4; 				// Helix parameter 1
+const double 	b_helix 					= 2;				// Helix parameter 2
+	//
+const int 		numRaysSquash	 			= 100;				// Number of rays (default = 100)		
+const double	lengthRaysSquash			= .5;				// Length of test rays											
+const boolean	showRaysSquash				= true;				// True = show test rays in 3D view	
+const double	openWidthAngleSquash		= 1;				// Width of the test space		(implicitly(!) defines angle)	
+const double	openHeightAngleSquash		= 1;//1;				// Heigth of the test space							
+const double 	predictedLengthSquash		= 0.1;				// Length of translation of ray origins along the current heading	
+const double	strengthOfChangeSquash		= 1;				// Strength of direction change		
+const double	dist2SurfSquash				= 0.001;				// Minimal distance of apex to favorNodes
+	
+// Milpa specific methods
+static boolean beanDormancy(BranchBase bb, Internode it, Apex ap, int phytDistance, int parentRank)
+{
+	if (determinate[commonbean]) {
+		if (phytDistance > ap.dom) { 
+			// bud break if phytomeric distance to apex is larger than dominance parameter
+				return false;
+		}
+		return true;
+	} else {
+		if (parentRank > 5) { 
+			// simple stochastic bud break if phytomeric distance to apex is large enough
+				float chance = random(0,1);
+				if(chance > (0.95)**(1/((ap.order+1)*(parentRank-5)))) { // RHS approaches 1 as order or parentrank grows large.
+					return false;
+				}
+		}
+		return true;
+	}
+}
+
+static void milpaProdFlowerIndeterminate()
+[
+	
+	//Normal indeterminate flower production if not commonbean or squash
+	a:Apex, (a.species != commonbean && a.species != squash && a.shouldProduceGenerative() == true && determinate[a.species] == false) ==>
+	i:Internode
+	[bb:BranchBase RU(30) RH(random(0,360)) aa:Apex]
+	for (1:a[nrLeaves]) (
+		[l:Leaf {l.initiate(a);}]
+		RH(360/a[nrLeaves]) 
+	)
+	[RL(45) f:Flower]
+	RH(a[phyllotaxis]+random(-10,10))
+	RL(random(-2.5,2.5)) RV(-0.6)
+	a
+	{
+		f.initiate(a);
+		i.initiate(a);
+		bb.initiate(a);
+		aa.initiateAxillary(a);
+		a.increment();
+	}
+	;
+	
+	{derive();}
+	
+	// Adjusted indeterminate flower production for common bean
+	a:Apex, (a.species == commonbean && a.shouldProduceGenerative() == true && determinate[a.species] == false) ==>
+	{
+		AvoidIntersection ai_bean_flower = new AvoidIntersection(numRaysBean); // Create new instance of AvoidIntersection for each plant (to ensure list FavorNodes is empty, and all local settings are correct)
+		ai_bean_flower.setRange(openWidthAngleBean, openHeightAngleBean, predictedLengthBean); // Set settings for test space (i.e. space that is to be explored for (un)friendly nodes)
+		ai_bean_flower.setDistance2Surface(dist2SurfBean); // Set minimal distance to surface of favorNode
+		//ai.prepareScene(); // use up-to-date scene
+		// Find closest maize internode, add all subsequent organs to FavorNodes
+		//derive();
+		javax.vecmath.Vector3d fW = new javax.vecmath.Vector3d();
+		if(beanPole == true) {
+			Cylinder i_init = selectWhereMin((*c:Cylinder*), distance(a,c));
+			ai_bean_flower.addFavorNode(i_init);
+			fW = direction(i_init);
+		} else {
+			Internode i_init = selectWhereMin((*i:Internode, (i.species == maize)*), distance(a,i));
+			for ( (* n:VisibleOrgan, (n.species == maize && n.plantNumber == i_init.plantNumber && ( (n instanceof Internode) || (n instanceof Leaf ) ) ) *) ) {
+				//println(n); //test, seems to work. 
+				//TO DO if "left of maize", right-turning, if "right of maize" left turning??
+				ai_bean_flower.addFavorNode(n);
+			}
+			fW = direction(i_init);
+		}
+		//ai.addFavorNode(i_init);
+		
+		// Helix-stuff
+		//fW = direction(i_init); 	// Head direction ('z-axis'); somehow javax.vecmath version required, otherwise direction() gives errors.
+		fW.normalize();
+		javax.vecmath.Vector3d unit = new javax.vecmath.Vector3d(1,0,0);
+		javax.vecmath.Vector3d fU = new javax.vecmath.Vector3d();
+		fU.cross(fW, unit);							// orthogonal vector to W ('y-axis')
+		fU.normalize();
+		javax.vecmath.Vector3d fV = new javax.vecmath.Vector3d();
+		fV.cross(fU, fW);							// orthogonal vector to both W and U ('x-axis')
+		fV.normalize();
+		// right-turning helix
+		//double a_helix = 4; 
+		//double b_helix = 2;
+		double dir1 = Math.cos(time/a_helix)*fV.x + Math.sin(time/a_helix)*fU.x + b_helix*fW.x;
+		double dir2 = Math.cos(time/a_helix)*fV.y + Math.sin(time/a_helix)*fU.y + b_helix*fW.y;
+		double dir3 = Math.cos(time/a_helix)*fV.z + Math.sin(time/a_helix)*fU.z + b_helix*fW.z;
+		Vector3d direction = new Vector3d(dir1,dir2,dir3);
+		direction.normalize();
+	}
+	//if (a.rank>3) (RD(direction, .5)) // directional tropism describing helix around line with same heading as closest maize internode
+	RD(direction, .5)
+	{ai_bean_flower.look(a, lengthRaysBean, strengthOfChangeBean, showRaysBean);}
+	i:Internode
+	[bb:BranchBase RU(30) RH(random(0,360)) aa:Apex]
+	for (1:a[nrLeaves]) (
+		[l:Leaf {l.initiate(a);}]
+		RH(360/a[nrLeaves]) 
+	)
+	[RL(45) f:Flower]
+	RH(a[phyllotaxis]+random(-10,10))
+	RL(random(-2.5,2.5)) //RV(-0.6) //RR test
+	a
+	{
+		f.initiate(a);
+		i.initiate(a);
+		bb.initiate(a);
+		aa.initiateAxillary(a);
+		a.increment();
+	}
+	;
+	
+	{derive();}
+	
+	//Adjusted indeterminate flower production for squash, which expands horizontally along the soil surface
+	a:Apex, (a.species == squash && a.shouldProduceGenerative() == true && determinate[a.species] == false) ==>
+	{
+		// AvoidIntersection	
+		AvoidIntersection ai_squash_flower = new AvoidIntersection(numRaysSquash); // Create new instance of AvoidIntersection for each plant (to ensure list FavorNodes is empty, and all local settings are correct)
+		ai_squash_flower.setRange(openWidthAngleSquash, openHeightAngleSquash, predictedLengthSquash); // Set settings for test space (i.e. space that is to be explored for (un)friendly nodes)
+		ai_squash_flower.setDistance2Surface(dist2SurfSquash); // Set minimal distance to surface of favorNode
+		//ai.prepareScene(); // use up-to-date scene
+		//derive();
+		//Tile tile_init = selectWhereMin((*t:Tile*), distance(a,t));	// Tile closest to a. //TODO eventually replace this by just adding all Tiles to FavorNodes.
+		for ( (* t:Tile *) ) {
+			//println(t); //test 
+			ai_squash_flower.addFavorNode(t);
+		}
+		//ai.addFavorNode(tile_init);
+		// Addtional directional tropism
+		javax.vecmath.Vector3d fW = direction(a); 	// Head direction ('z-axis') of current apex; somehow javax.vecmath version required, otherwise direction() gives errors.
+		fW.normalize();
+		Vector3d fV = new Vector3d(random(-1.5,1.5),random(-1.5,1.5),0);
+		fV.normalize();
+		Vector3d direction = new Vector3d(fW.x+fV.x,fW.y+fV.y,0);
+		direction.normalize();
+	}
+	RD(direction, .5) // directional tropism towards horizontal plane with some randomness in x- and y-direction
+	{ai_squash_flower.look(a, lengthRaysSquash, strengthOfChangeSquash, showRaysSquash);} 
+	i:Internode
+	[bb:BranchBase RU(30) RH(random(0,360)) aa:Apex]
+	for (1:a[nrLeaves]) (
+		[l:Leaf {l.initiate(a);}]
+		RH(360/a[nrLeaves]) 
+	)
+	[RL(45) f:Flower]
+	RH(a[phyllotaxis]+random(-10,10))
+	RL(random(-2.5,2.5)) //RV(-0.6)
+	a
+	{
+		f.initiate(a);
+		i.initiate(a);
+		bb.initiate(a);
+		aa.initiateAxillary(a);
+		a.increment();
+	}
+	;
+]
+
+static void milpaProdVegPhyt()
+[
+	Line ==>; //TEST
+	// Create instance of AvoidIntersection
+	//ai = new AvoidIntersection(numRays);
+	
+	//Normal veg. phyt. production if not common bean or squash
+	a:Apex, (a.species != commonbean && a.species != squash && a.shouldProduceVegetative() == true) ==>
+	i:Internode
+	[bb:BranchBase RU(45) RH(random(0,360)) aa:Apex]
+	for (1:a[nrLeaves]) (
+		[l:Leaf {l.initiate(a);}]
+		RH(360/a[nrLeaves]) 
+	)
+	RH(a[phyllotaxis]+random(-10,10))
+	RL(random(-2.5,2.5))  RV(-0.6)
+	a
+	{	
+		i.initiate(a);
+		bb.initiate(a);
+		aa.initiateAxillary(a);
+		a.increment();
+	}
+	;
+	
+	{derive();}
+	
+	//Adjusted veg. phyt. production for climbing bean, which climbs around climbing medium
+	a:Apex, (a.species == commonbean && a.shouldProduceVegetative() == true) ==>
+	{
+			AvoidIntersection ai_bean_veg = new AvoidIntersection(numRaysBean); // Create new instance of AvoidIntersection for each plant (to ensure list FavorNodes is empty, and all local settings are correct)
+			ai_bean_veg.setRange(openWidthAngleBean, openHeightAngleBean, predictedLengthBean); // Set settings for test space (i.e. space that is to be explored for (un)friendly nodes)
+			ai_bean_veg.setDistance2Surface(dist2SurfBean); // Set minimal distance to surface of favorNode
+			//ai.prepareScene(); // use up-to-date scene
+			// Find closest maize internode, add all subsequent organs to FavorNodes
+			//derive();
+			/*Internode i_init = selectWhereMin((*i:Internode, (i.species == maize)*), distance(a,i));
+			for ( (* n:VisibleOrgan, (n.species == maize && n.plantNumber == i_init.plantNumber && ( (n instanceof Internode) || (n instanceof Leaf ) ) ) *) ) {
+				println("bean veg "+ n +" ID "+ a.plantNumber); //test
+				//println(n); //test, seems to work.
+				ai_bean_veg.addFavorNode(n);
+			}
+			//ai.addFavorNode(i_init);
+			
+			// Helix-stuff
+			javax.vecmath.Vector3d fW = direction(i_init); 	// Head direction ('z-axis'); somehow javax.vecmath version required, otherwise direction() gives errors.
+			*/
+			javax.vecmath.Vector3d fW = new javax.vecmath.Vector3d();
+			if(beanPole == true) {
+				Cylinder i_init = selectWhereMin((*c:Cylinder*), distance(a,c));
+				ai_bean_veg.addFavorNode(i_init);
+				fW = direction(i_init);
+			} else {
+				Internode i_init = selectWhereMin((*i:Internode, (i.species == maize)*), distance(a,i));
+				for ( (* n:VisibleOrgan, (n.species == maize && n.plantNumber == i_init.plantNumber && ( (n instanceof Internode) || (n instanceof Leaf ) ) ) *) ) {
+					//println(n); //test, seems to work. 
+					//TO DO if "left of maize", right-turning, if "right of maize" left turning??
+					ai_bean_veg.addFavorNode(n);
+				}
+				fW = direction(i_init);
+			}
+			// Helix-stuff
+			fW.normalize();
+			javax.vecmath.Vector3d unit = new javax.vecmath.Vector3d(1,0,0);
+			javax.vecmath.Vector3d fU = new javax.vecmath.Vector3d();
+			fU.cross(fW, unit);							// orthogonal vector to W ('y-axis')
+			fU.normalize();
+			javax.vecmath.Vector3d fV = new javax.vecmath.Vector3d();
+			fV.cross(fU, fW);							// orthogonal vector to both W and U ('x-axis')
+			fV.normalize();
+			// right-turning helix
+			//double a_helix = 4; 
+			//double b_helix = 1;
+			double dir1 = Math.cos(time/a_helix)*fV.x + Math.sin(time/a_helix)*fU.x + b_helix*fW.x;
+			double dir2 = Math.cos(time/a_helix)*fV.y + Math.sin(time/a_helix)*fU.y + b_helix*fW.y;
+			double dir3 = Math.cos(time/a_helix)*fV.z + Math.sin(time/a_helix)*fU.z + b_helix*fW.z;
+			Vector3d direction = new Vector3d(dir1,dir2,dir3);
+			direction.normalize();
+	}
+	RD(direction, .5) // directional tropism describing helix around line with same heading as closest maize internode
+	{
+		//System.out.println("Bean before Look, after add"); //TEST
+		//ai_bean_veg.printNodes(); // TEST, method in avoidIntersection class to print list favorNodes.
+		ai_bean_veg.look(a, lengthRaysBean, strengthOfChangeBean, showRaysBean);
+	} 
+	i:Internode
+	[bb:BranchBase RU(45) RH(random(0,360)) aa:Apex]
+	for (1:a[nrLeaves]) (
+		[l:Leaf {l.initiate(a);}]
+		RH(360/a[nrLeaves]) 
+	)
+	RH(a[phyllotaxis]+random(-10,10))
+	RL(random(-2.5,2.5))  //RV(-0.6) //RR test
+	//Test
+	//	RL(random(30,100))
+	//
+	a
+	{	
+		i.initiate(a);
+		bb.initiate(a);
+		aa.initiateAxillary(a);
+		a.increment();
+	}
+	;
+	
+	{derive();}
+	
+	//Adjusted veg. phyt. production for squash, which expands horizontally along the soil surface
+	a:Apex, (a.species == squash && a.shouldProduceVegetative() == true) ==>
+	{
+		/*// AvoidIntersection	
+		AvoidIntersection ai = new AvoidIntersection(numRaysSquash); // Create new instance of AvoidIntersection for each plant (to ensure list FavorNodes is empty, and all local settings are correct)
+		ai.setRange(openWidthAngleSquash, openHeightAngleSquash, predictedLengthSquash); // Set settings for test space (i.e. space that is to be explored for (un)friendly nodes)
+		ai.setDistance2Surface(dist2SurfSquash); // Set minimal distance to surface of favorNode
+		ai.prepareScene(); // use up-to-date scene
+		derive();
+		Tile tile_init = selectWhereMin((*t:Tile*), distance(a,t));	// Tile closest to a. //TODO eventually replace this by just adding all Tiles to FavorNodes.
+		/*for ( (* t:Tile *) ) {
+			//println(t); //test 
+			ai.addFavorNode(t);
+		}*
+		ai.addFavorNode(tile_init); */ 
+		// Addtional directional tropism
+		javax.vecmath.Vector3d fW = direction(a); 	// Head direction ('z-axis') of current apex; somehow javax.vecmath version required, otherwise direction() gives errors.
+		fW.normalize();
+		double angle = random(-5,5);
+		Vector3d fV = new Vector3d(Math.cos(angle), Math.sin(angle),0);
+		//fV.normalize();
+		Vector3d direction = new Vector3d(fW.x+fV.x,fW.y+fV.y,0);
+		direction.normalize();
+		//println(direction);
+	}
+	if(a.cpn==1) (RU(65)) //TEST
+	//RD(direction, 1) // directional tropism towards horizontal plane with some randomness in x- and y-direction
+	//{println("a1 = "+ direction(a));} //TEST
+	a
+	;
+	
+	{derive();}
+	
+	a:Apex, (a.species == squash && a.shouldProduceVegetative() == true) ==> //TEST Squash part 2
+	//{println("a2 = "+ direction(a));}
+	{
+		// AvoidIntersection	
+		AvoidIntersection ai_squash_veg = new AvoidIntersection(numRaysSquash); // Create new instance of AvoidIntersection for each plant (to ensure list FavorNodes is empty, and all local settings are correct)
+		ai_squash_veg.setRange(openWidthAngleSquash, openHeightAngleSquash, predictedLengthSquash); // Set settings for test space (i.e. space that is to be explored for (un)friendly nodes)
+		ai_squash_veg.setDistance2Surface(dist2SurfSquash); // Set minimal distance to surface of favorNode
+		//ai_squash_veg.prepareScene(); // use up-to-date scene
+		//derive();
+		//Tile tile_init = selectWhereMin((*t:Tile*), distance(a,t));	// Tile closest to a. //TODO eventually replace this by just adding all Tiles to FavorNodes.
+		for ( (* t:Tile *) ) {
+			println("squash tiles "+ t); //test 
+			ai_squash_veg.addFavorNode(t);
+		} 
+		for ( (* s:RootApex *) ) {
+			println("Soil box "+ s); //test 
+			ai_squash_veg.addFavorNode(s);
+		}
+		//ai.addFavorNode(tile_init);
+		//println("a3 = "+ direction(a));
+		System.out.println("Squash before Look, after add"); //TEST
+		//ai_squash_veg.printNodes(); // TEST, method in avoidIntersection class to print list favorNodes.
+		ai_squash_veg.look(a, lengthRaysSquash, strengthOfChangeSquash, showRaysSquash);
+		//System.out.println("after Look");
+		//ai_squash_veg.printNodes(); // TEST both before and after show correct list, so favorNodes is filled correctly. Fault must be in look()
+	} // END TEST
+	i:Internode
+	[bb:BranchBase RU(45) RH(random(0,360)) aa:Apex]
+	for (1:a[nrLeaves]) (
+		[l:Leaf {l.initiate(a);}]
+		RH(360/a[nrLeaves]) 
+	)
+	RH(a[phyllotaxis]+random(-10,10))
+	//RL(random(-2.5,2.5))  //RV(-0.6)
+	a
+	{	
+		i.initiate(a);
+		bb.initiate(a);
+		aa.initiateAxillary(a);
+		a.increment();
+	}
+	;
+]
+
+static void foldMaize()
+[
+	{float angle = random(0,360);}
+	// Rotate internode
+	i:Internode, (milpa == true && i.species == maize && time == maizeFoldDay && i.rank == maizeFoldRank) ==> 
+	RH(angle) RU(150) i;
+	// Rotate corresponding leaf attached to bottom of rotated internode
+	(* l:Leaf <+ ii:Internode (-->)+ i:Internode, (i.rank==maizeFoldRank && ii.rank==maizeFoldRank-1) *), l, (time == maizeFoldDay) ==> 
+	RH(angle) RU(-150) l;
+	// Remove RV rotations, to prevent maize stalk from curling upwards again
+	(* rv:RV (<--)+ i:Internode, (i.rank==maizeFoldRank) *), rv ==> ; 
+]	

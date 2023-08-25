@@ -1,0 +1,608 @@
+/**
+* Name: Elementary effects for general models
+* Version: 1.0 (Oct. 2022)
+* Author: R.J.L. Rutjens (rik.rutjens@nottingham.ac.uk)
+* Description: 
+* 	This code accompanies the paper `Scaled Elementary Effects for global sensitivity analysis of functional-structural plant models'. 
+*	It is to be used together with the functional-structural plant model FSPM_BASIC. While this is a collection of .rgg files (which extends Java),
+*	the code is 99% Java-compatible (except for the links with the RGG-platform GroIMP), and one
+*	can just copy/paste parts of the code to their own implementation.
+*	This file only implements the following method:
+*		1. ‘Standard’ Rd radial (for double type inputs: generate all points by Sobol QR; for integer/Boolean
+*		   	type inputs: generate base value by Rd QR, transform to nearest attainable value, then step by delta_i)
+*			--> elementaryEffectsTrajectoriesStandardRdRad()
+*	For other approaches, see paper ‘Elementary Effects for models with dimensional inputs of arbitrary type and range: scaling and trajectory generation’.
+*
+* 	The following steps should be taken before running the analysis:
+* 		1. Set boolean carryOutElemEffAnalysis to true;
+*		2. Download external libraby Apache Commons math (see below for details);
+*		2a. Set input/output filenames;
+*		3. Set number of trajectories r (typically ~10-50, more is better!);
+*				Note: total #simulations = r*(#parameters+1).
+*		3a. Set importance threshold h
+*		4. Insert parameter names, lower and upper bounds, # levels (p_i), type, etc. into e.g. Input/ParametersTestModel.txt; 
+*				Note: for boolean parameters, max = 1, min = 0, p=2. For double/integer parameters, typically p=4 is taken, but this depends on the model. 
+*				For integer-valued parameters, you must choose p_i, min_i and max_i such that (max_i-min_i) = n*(p_i-1), where n is an integer.
+*				Tip: the free software Notepad++ allows some handy manipulations, such as block selection (use Alt-key).
+*		5. If applicable: value of Delta is determined by column cdelta in said .txt-file, by Delta_i = cdelta_i/(p_i-1)); Note that Morris' optimal value Delta_i = p_i/(2*(p_i-1))) for p_i even;
+*		6. Fill String[] outputs with desired outputs (names do not need to match parameternames; matching is done manually for now);
+* 		7. Manually adapt the list of parameters in elementaryEffectsSetNextParameterPoint() to match the parameters in ParametersTestModel.csv;
+*				Note: the sequence matters. Also, the names must be the exact parameter names. If needed, convert parameter from double to int.
+*		8. In elementaryEffectsCalcEffects(), set variables "index" and "skiprows";
+*		9. If applicable: set all free parameters that are not included in the analysis;
+*		10. Hit Run run and wait.
+*		
+* Remarks:
+*	- Caution is advised when saving either text or code files in a cloud-based location (e.g. OneDrive, *	   Dropbox); automatic syncing might cause errors ("document x has been changed") which terminates the *	 run. Hence it is advisable to switch off syncing whilst running simulations.
+*	- The by times out of date Java syntax (e.g. typecasting) is a consequence of the GroIMP platform it runs on. 
+*	  Feel free to modernise if you do not intend to use GroIMP.
+*	- Feel free to use, adapt and distribute this code or parts thereof, but please consider including
+*	  a reference to our paper in your implementation or publication.
+**/
+
+
+import java.io.*;
+
+import static parameters.*;
+// External library Apache Commons math for matrix operations and combinations/permutations; required for EE sensitivity analysis. 
+// Library is freely available online. Put .jar-file in folder named "ext", 
+// and place folder in GroIMP main folder (i.e. C:\Program Files (x86)\GroIMP-1.5)
+import org.apache.commons.math3.util.CombinatoricsUtils;
+import org.apache.commons.math3.linear.*;
+import org.apache.commons.math3.random.*;
+import org.apache.commons.math3.stat.descriptive.rank.Median;
+import java.util.*;
+import java.lang.Math;
+import java.util.concurrent.ThreadLocalRandom;
+import static java.util.Arrays.asList;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Scanner;
+
+static boolean carryOutElemEffAnalysis = true; 				// If True, do EE analyis, if false, do nothing in main.run()
+
+public class ElementaryEffects implements Serializable {
+	private static final long serialVersionUID = -5280969551429641622L; // GroIMP threw SASException error; this fixes it, but not sure why. Has something to do with serializable (which was also added because of a vague GroIMP error). Someone with decent Java-knowledge could take a look at this.
+	// Initialization of objects used by multiple methods.
+	private List parameterNames = new ArrayList();		// Arraylist of strings containing parameter names
+	private List min = new ArrayList(); 			// Array with parameter lower bounds 
+	private List max = new ArrayList(); 			// Array with parameter lower bounds 
+	static double[] parameterValues;				// Array with parameter values to be used for next simulation run
+	String[] outputs = {"leafArea", "LAI"};		// Array of desired outputs; manually note here and make sure to save correct output values.
+	int outputLength = outputs.length;
+	private int k;									// Number of inputs/factors/parameters
+	private List ptemp = new ArrayList(); 
+	private List typetemp = new ArrayList(); 
+	private List cdeltatemp = new ArrayList(); 
+	private int[] p;					// Number of possible values (levels) parameters can take; parameter-dependent; take each entry even number.
+	private int[] type;					// input type: 0 = double; 1= int; 2 = boolean
+	private int[] cdelta;					// delta[i] = cdelta[i]/(p[i]-1). Optimal value (Morris) cdelta[i]=p[i]/2 when p[i] is even
+	private int r = 40; //(int) Math.pow(2,10);		// Number of trajectories (of length k+1) 
+	private int QRshift = 4;		// shift for B-matrix in QR sequences.
+	private int burninAmount = 0; 	// Skip first x elements of QR sequence
+	private int[] h = {5,10,15,20,25,30}; 			// Thresholds for (un)important parameter identification; percentage (0-100) of contribution to sum of normalized effects.
+	private RealMatrix Delta;		// Step size (if trajectories), dependent on parameter. Delta_i = p_i/[2(p_i-1)] is optimal choice. Delta must be column vector.
+	private RealMatrix Y;			//output.length];			// Matrix containing simulation outputs for every run
+	private RealMatrix X;			// (Not in use atm) Points in parameter space to be used for analysis
+	RealMatrix EE;			// Matrix with all elementary effects (normal Morris method)
+	private RealMatrix B_total;		// Matrix with all M trajectories 
+	private RealMatrix B_totalNew;  // Matrix with all numDiff unique trajectories 
+	static RealMatrix B_optimal;	// Matrix with the r trajectories to be used for simulations	
+	double[][] mu; double[][] mu_cx; // Some measures; effect mean, median, std
+	double[][] mu_abs; double[][] mu_abs_cx; 
+	double[][] xi; double[][] xi_cx;
+	double[][] sigma; double[][] sigma_cx; 
+	double discrepancy;
+	// SET 
+	// File names 
+	private String inputFileParameters = "C:/Users/***/Input/ParametersMaize.txt";
+	private String outputFileTrajectories = "C:/Users/***/Output/FSPM_BASIC_Trajectories_EE_Final.txt";
+	public String outputFileOutputs = "C:/Users/***/Output/field_test_Rep_3_Core_1.txt";
+	private String outputFileEffects = "C:/Users/***/Output/FSPM_BASIC_Effects_test_Rep_3_Core_1.txt";
+	private String outputFileMeasuresUnscaled = "C:/Users/***/Output/FSPM_BASIC_Measures_test_Rep_3_Core_1.txt";
+	private String outputFileMeasuresScaled = "C:/Users/***/Output/FSPM_BASIC_MeasuresScaled_test_Rep_3_Core_1.txt"; 
+	private String inputFileSimulationPoints = "C:/Users/***/Input/SimulationPoints_Core_1.txt";
+	
+	/*** ************************ ***/
+	/*** ************************ ***/
+	/***  Generate trajectories	  ***/	
+	/*** ************************ ***/
+	/*** ************************ ***/
+
+	void elementaryEffectsTrajectoriesStandardRdRad() {
+		// Standard Rd QR radial when possible: generate base points with R2, then step according to delta-values for int/boolean type
+		Y = MatrixUtils.createRealMatrix(r*(k+1), outputLength);	// Output vector
+		EE = MatrixUtils.createRealMatrix(r*k, Y.getColumnDimension());			// Matrix with all elementary effects
+		RealMatrix rSequence = MatrixUtils.createRealMatrix(r+QRshift, 2*k); // matrix with base points 
+		double phi=2; // Approximation of solution phi_d to x^(d+1)=x+1
+		for(int i=0; i<20; i++){
+			phi = Math.pow((1+phi),(1.0/(k+1))); 
+		}
+		double[] alpha = new double[2*k];
+		for(int i=0; i<2*k; i++){
+			alpha[i] = (1/(phi**(i+1)))%1;
+		}
+		for(int i=0; i<r+QRshift; i++){
+			for(int j=0; j<2*k; j++){ // seed (here 0.5) can be anything, but apparently 0.5 is generally better
+				//rSequence.setEntry(i,j,(0.5+alpha[j]*(i+1))%1);
+				rSequence.setEntry(i,j,(0.5+alpha[j]*(i+1+burninAmount))%1); // Optional QR burn-in
+			}
+		}
+		//transform base values to discrete ones iff int/boolean type (i.e. binning procedure). Multiply by p[i], take integer part (i.e. floor), divide by p[i]-1
+		for(int i=0; i<r; i++){
+			for(int j=0; j<k; j++){
+				if(type[j]!=0){
+					if(rSequence.getEntry(i,j)==1){rSequence.setEntry(i,j,1);} 
+					else {
+						rSequence.setEntry(i,j,(double) (Math.floor(rSequence.getEntry(i,j)*(p[j])))/(p[j]-1));
+					}
+				}
+			}
+		} 
+		B_optimal = MatrixUtils.createRealMatrix(r*(k+1),k); // Matrix with all simulation points
+		for(int i=0; i<r; i++){ // 'trajectory' i
+			for(int l=0; l<k+1; l++){ // point l on 'trajectory' (l=1 means perturbed in x1-dimension)
+				if(l==0){ // base point
+					B_optimal.setSubMatrix(rSequence.getSubMatrix(i,i,0,k-1).getData(),i*(k+1),0); 
+				} else {
+					B_optimal.setSubMatrix(rSequence.getSubMatrix(i,i,0,k-1).getData(),i*(k+1)+l,0); //TEST 17/11/21
+					if(type[l-1]!=0){ // For TEST 03/11/21 test effect of randomness in model: comment this block.
+						if(B_optimal.getEntry(i*(k+1),l-1)<Delta.getEntry(l-1,0)){
+							B_optimal.setEntry(i*(k+1)+l,l-1,B_optimal.getEntry(i*(k+1),l-1)+Delta.getEntry(l-1,0));
+						} else if(B_optimal.getEntry(i*(k+1),l-1)>1-Delta.getEntry(l-1,0)) {
+							B_optimal.setEntry(i*(k+1)+l,l-1,B_optimal.getEntry(i*(k+1),l-1)-Delta.getEntry(l-1,0));
+						} else {
+							double rand = random(0,1);
+							if(rand<0.5){
+								B_optimal.setEntry(i*(k+1)+l,l-1,B_optimal.getEntry(i*(k+1),l-1)+Delta.getEntry(l-1,0));
+							} else {
+								B_optimal.setEntry(i*(k+1)+l,l-1,B_optimal.getEntry(i*(k+1),l-1)-Delta.getEntry(l-1,0));
+							}
+						}
+					} else {
+						B_optimal.setEntry(i*(k+1)+l,l-1,rSequence.getEntry(i+QRshift,k+l-1)); 
+					}
+				}
+			}
+		}
+		// Transform parameter values (i.e. columns of B_rand) to their actual intervals [min_i, max_i]
+		for (int i=0; i<k; i++) {
+			if(type[i]==0){
+				B_optimal.setColumnMatrix(i, (B_optimal.getColumnMatrix(i).scalarMultiply((Double) max.get(i) - (Double) min.get(i))).scalarAdd((Double) min.get(i)));
+			} else { // Ensure integer values for int/boolean inputs; somehow roundoff error might cause 10 to become 10.00000000002, for example.
+				for(int j=0; j<r*(k+1); j++){
+					B_optimal.setEntry(j,i, Math.floor(B_optimal.getEntry(j,i)*((Double) max.get(i) - (Double) min.get(i))+((Double) min.get(i))));
+				}
+			}
+		}
+		// Export trajectory to txt file using simple PrintWriter 
+		FileWriter fileWriter = new FileWriter(new File(outputFileTrajectories));
+		PrintWriter printWriter = new PrintWriter(fileWriter);
+		printWriter.println("For details about number of parameters and corresponding levels, see input file.");
+		for(int i = 0; i<r*(k+1); i++) {
+			printWriter.println();
+			for(int j=0; j<k; j++) {
+				printWriter.print(B_optimal.getEntry(i,j) + "  " ); 
+			}
+			if((i+1)%(k+1)==0){printWriter.println();}
+		}
+		printWriter.close(); 
+	}
+	
+	/*** ************************ ***/
+	/*** ************************ ***/
+	/*** 	Calculate effects	  ***/	
+	/*** ************************ ***/
+	/*** ************************ ***/	
+		
+	void elementaryEffectsCalcEffectsRadial() {
+		// Recall: Y = MatrixUtils.createRealMatrix(r*(k+1), outputs.size());
+		try
+		{	// Fill matrix Y with the desired outputs
+			Scanner scanner = new Scanner(new File(outputFileOutputs));
+			int[] index = {9,2}; // Manually add column numbers in field for outputs of choice. Note: count starts from 0. Example: Yield, LAI = {7, 2}
+			int skiprows = time; // Manually state how many rows need to be skipped: we only need data on last time (e.g. day 19). NOTE: this day != days to harvest necessarily
+			int tempcounter = 0;
+			int i=0;
+			while(scanner.hasNext()){
+				String[] inputArr = scanner.nextLine().split("\\s+"); // delimiter is any amount of whitespace
+				if(tempcounter % skiprows == 0 && tempcounter > 0) {
+					for (int j=0; j<Y.getColumnDimension(); j++) {
+						Y.setEntry(i,j,Double.parseDouble(inputArr[index[j]]));
+					}
+					i++;
+				}
+				tempcounter ++;
+			}
+			scanner.close();
+		}
+		catch(FileNotFoundException e)
+		{
+			println(e.getMessage());
+		}
+		// For each output, each trajectory and for each subsequent 2 parameter points within this trajectory, calculate effect
+		for (int kk = 0; kk< Y.getColumnDimension(); kk++) { // loop over all selected outputs
+			//
+			// Note: Y is r*(k+1) x #outputs matrix.
+			//
+			for (int i=0; i<r; i++) {// trajectory number 
+				for (int j = 0; j<k; j++) { // Parameter number
+					Delta.setEntry(j,0,Math.abs((Double)B_optimal.getEntry(i*(k+1),j)-(Double)B_optimal.getEntry(i*(k+1)+j+1,j))); 
+					double deltaTemp = ( (Double)Delta.getEntry(j,0)*((Double)max.get(j)-(Double)min.get(j)) );
+					if (B_optimal.getEntry(i*(k+1),j) <= B_optimal.getEntry(i*(k+1)+j+1,j)) { // i.e. increased parameter value in next step 
+						// EE[i*k+j][kk] is the effect of the j-th parameter in the i-th trajectory for the kk-th output
+						EE.setEntry(i*k+j,kk, ((Double)Y.getEntry(i*(k+1)+j+1,kk) - (Double)Y.getEntry(i*(k+1),kk))/deltaTemp);
+					} else { // i.e. decreased parameter value in next step 
+						EE.setEntry(i*k+j,kk, ((Double)Y.getEntry(i*(k+1),kk) - (Double)Y.getEntry(i*(k+1)+j+1,kk))/deltaTemp); 
+					}
+				}
+			}
+		}
+		// Export raw effects to txt file using simple PrintWriter 
+		FileWriter fileWriter = new FileWriter(new File(outputFileEffects));
+		PrintWriter printWriter = new PrintWriter(fileWriter);
+		printWriter.printf("%-30s %-30s %-10s %-10s %n", "Parameter", "Output", "Trajectory", "Effect (unscaled)");
+		for(int i = 0; i<r*k; i++) {
+			//printWriter.println();
+			for(int j=0; j<Y.getColumnDimension(); j++) {
+				//printWriter.printf("%-30s %-30s %-10.3f %n", (String) parameterNames.get(i%k), (String) "Y_"+j, (Double) EE.getEntry(i,j)); 
+				printWriter.printf("%-30s %-30s %-10.0f %-10.3f %n", (String) (i%k+1)+": "+ parameterNames.get(i%k), (String) outputs[j], (1+Math.floor((Double) i/k)) ,(Double) EE.getEntry(i,j)); // Specifically for testmodel
+			}
+		}
+		printWriter.close(); 
+	}
+	
+	/*** ************************ ***/
+	/*** ************************ ***/
+	/*** 	Calculate measures	  ***/	
+	/*** ************************ ***/
+	/*** ************************ ***/
+	
+	void elementaryEffectsCalcMeasures() { 
+		// Scale effects and calculate measures
+		mu = new double[k][Y.getColumnDimension()]; mu_abs = new double[k][Y.getColumnDimension()]; sigma = new double[k][Y.getColumnDimension()]; // Unscaled measures
+		mu_cx = new double[k][Y.getColumnDimension()]; mu_abs_cx = new double[k][Y.getColumnDimension()]; sigma_cx = new double[k][Y.getColumnDimension()]; // Measures scaled by (max_i-min_i)
+		xi = new double[k][Y.getColumnDimension()]; xi_cx = new double[k][Y.getColumnDimension()];
+		for (int kk = 0; kk< Y.getColumnDimension(); kk++) {
+			for (int j = 0; j<k; j++) { 
+				for (int i = 0; i<r; i++) {
+					mu[j][kk] += (Double) EE.getEntry(i*k+j,kk);
+					mu_abs[j][kk] += Math.abs((Double) EE.getEntry(i*k+j,kk));
+				}
+				mu[j][kk] /= r;
+				mu_abs[j][kk] /= r;
+				mu_cx[j][kk] = mu[j][kk]*((Double) max.get(j) - (Double) min.get(j));
+				mu_abs_cx[j][kk] = mu_abs[j][kk]*((Double) max.get(j) - (Double) min.get(j));
+				// Median calculation: first make array of all absolute effects, then use median function to calculate absolute median
+				double[] tempxi = new double[r];
+				for (int i = 0; i<r; i++) {
+					tempxi[i] = Math.abs(EE.getEntry(i*k+j,kk));
+				}
+				xi[j][kk] = new Median().evaluate(tempxi);
+				xi_cx[j][kk] = xi[j][kk]*((Double) max.get(j) - (Double) min.get(j));
+				for (int i = 0; i<r; i++) {
+					sigma[j][kk] += (EE.getEntry(i*k+j,kk)-mu[j][kk])**2;  
+				}
+				sigma[j][kk] /= (r-1);
+				sigma[j][kk] = Math.sqrt(sigma[j][kk]);
+				sigma_cx[j][kk] = sigma[j][kk]*((Double) max.get(j) - (Double) min.get(j));
+			}
+		} 
+		// Export measures to txt file using simple PrintWriter 
+		// Unscaled
+		FileWriter fileWriter = new FileWriter(new File(outputFileMeasuresUnscaled));
+		PrintWriter printWriter = new PrintWriter(fileWriter);
+		printWriter.printf("%-30s %-30s %-10s %-10s %-10s %-10s %n", "Parameter names", "Output", "Mu_i", "Mu*_i", "Chi_i", "Sigma_i");
+		for(int j=0; j<Y.getColumnDimension(); j++){
+			for(int i = 0; i<k; i++) { 
+				printWriter.printf("%-30s %-30s %-10.3f %-10.3f %-10.6f %-10.3f %n", (String) (i+1)+": "+ parameterNames.get(i), (String) outputs[j], mu[i][j], mu_abs[i][j], xi[i][j], sigma[i][j]);
+				//printWriter.printf("%-30s %-30s %-10.3f %-10.3f %-10.6f %-10.3f %n", (String) "X_"+(i), (String) "Y_"+j, mu[i][j], mu_abs[i][j], xi[i][j], sigma[i][j]);
+			}
+		}
+		printWriter.close(); 
+		// Scaled by (max_i-min_i), includes dimensionless sensitivity indices S_i = Chi_i/sum(Chi_j) and S_i = Mu_i^*/sum(Mu_j^*).
+		double[][] S_dimless = new double[k][Y.getColumnDimension()]; double[][] S_dimless2 = new double[k][Y.getColumnDimension()]; 
+		double[] xisum = new double[Y.getColumnDimension()];  double[] musum = new double[Y.getColumnDimension()];
+		FileWriter fileWriter2 = new FileWriter(new File(outputFileMeasuresScaled));
+		PrintWriter printWriter2 = new PrintWriter(fileWriter2);
+		printWriter2.printf("%-30s %-30s %-10s %-10s %-10s %-10s %n", "Parameter names", "Output", "Mu_i", "Mu*_i", "Chi_i", "Sigma_i");
+		for(int j=0; j<Y.getColumnDimension(); j++){
+			for(int i = 0; i<k; i++) { 
+				printWriter2.printf("%-30s %-30s %-10.3f %-10.3f %-10.6f %-10.3f %n", (String) (i+1)+": "+ parameterNames.get(i), (String) outputs[j], mu_cx[i][j], mu_abs_cx[i][j], xi_cx[i][j], sigma_cx[i][j]);
+				//printWriter2.printf("%-30s %-30s %-10.3f %-10.3f %-10.6f %-10.3f %n", (String) "X_"+(i), (String) "Y_"+j, mu_cx[i][j], mu_abs_cx[i][j], xi_cx[i][j], sigma_cx[i][j]);
+				xisum[j] += xi_cx[i][j];
+				musum[j] += mu_abs_cx[i][j];
+			}
+		}
+		printWriter2.println("");
+		printWriter2.printf("%-30s %n", (String) "Dimensionless sensitivity indices:");
+		printWriter2.printf("%-30s %-30s %-20s %-20s %n", (String) "Parameter", (String) "Output", "S_Xi", "S_mu*");
+		for(int j=0; j<Y.getColumnDimension(); j++){
+			for(int i = 0; i<k; i++) { 
+				S_dimless[i][j] = xi_cx[i][j]/xisum[j];
+				S_dimless2[i][j] = mu_abs_cx[i][j]/musum[j];
+				//printWriter2.printf("%-30s %-30s %-20.6f %-20.6f %n", (String) "X_"+(i), (String) "Y_"+j, S_dimless[i][j], S_dimless2[i][j]);
+				printWriter2.printf("%-30s %-30s %-20.6f %-20.6f %n", (String) (i+1)+": "+ parameterNames.get(i), (String) outputs[j], S_dimless[i][j], S_dimless2[i][j]);
+			}
+		}
+		printWriter2.println("");
+		// Order sensitivity indices and output ordered parameters from highest to lowest; determine (un)important parameters; 
+		for(int j=0; j<Y.getColumnDimension(); j++) { 
+			RealVector temparray = new ArrayRealVector(k);
+			RealVector indexes = new ArrayRealVector(k);
+			double[] indexestemp = new double[k];
+			RealVector temparray2 = new ArrayRealVector(k);
+			RealVector indexes2 = new ArrayRealVector(k);
+			for(int i = 0; i<k; i++) {
+				temparray.setEntry(i,S_dimless[i][j]);
+				temparray2.setEntry(i,S_dimless2[i][j]);
+			}
+			for(int i = 0; i<k; i++) {
+				//println(Arrays.toString(temparray));
+				int tempindex = temparray.getMaxIndex();
+				if(temparray.getEntry(tempindex)==0){
+					indexestemp = indexes.toArray();
+					Arrays.sort(indexestemp);
+					int tempint = 1;
+					for(int kk=0; kk<k; kk++){
+						if(indexestemp[kk]==tempint ){ tempint++;}
+					}
+					indexes.setEntry(i,Integer.parseInt(tempint));
+					temparray.setEntry(tempint-1,-1); //TEST
+				} else {
+					indexes.setEntry(i,Integer.parseInt(tempindex+1));
+					temparray.setEntry(tempindex,-1);
+				}
+				int tempindex2 = temparray2.getMaxIndex();
+				if(temparray2.getEntry(tempindex2)==0){
+					indexestemp = indexes2.toArray();
+					Arrays.sort(indexestemp);
+					int tempint = 1;
+					for(int kk=0; kk<k; kk++){
+						if(indexestemp[kk]==tempint ){ tempint++;}
+					}
+					indexes2.setEntry(i,Integer.parseInt(tempint));
+					temparray2.setEntry(tempint-1,-1); //TEST
+				} else {
+					indexes2.setEntry(i,Integer.parseInt(tempindex2+1));
+					temparray2.setEntry(tempindex2,-1);
+				}
+			}
+			int[] tempindexes = new int[k]; int[] tempindexes2 = new int[k];
+			
+			for(int i = 0; i<k; i++){
+				tempindexes[i] = (int) indexes.getEntry(i);
+				tempindexes2[i] = (int) indexes2.getEntry(i);
+			}
+			printWriter2.printf("%-50s %-30s %n", (String) "sorted parameters (high to low) according to S_xi/S_mu", (String) "and output "+outputs[j]);
+			printWriter2.println("S_xi: " + Arrays.toString(tempindexes));
+			printWriter2.println("S_mu: " + Arrays.toString(tempindexes2));
+			printWriter2.println("");
+			
+			// Given output j and threshhold h, determine which paramaters are (un)important. 
+			for(int hh = 0; hh<h.length; hh++){
+				// Based on S_xi:
+				int thresholdtemp = 0; 
+				double thresholdtempd = 0;
+				// find unimportant group
+				while(thresholdtempd < 1.0*h[hh]/100){
+					thresholdtempd += S_dimless[(int) indexes.getEntry(k-1-thresholdtemp)-1][j];
+					thresholdtemp++;
+				}
+				int[] unimportantfactors = new int[thresholdtemp];
+				for(int i=0; i<thresholdtemp; i++){
+					unimportantfactors[i] = (int) indexes.getEntry(k-1-i);	
+				}
+				double tresholdactive = 0; // Mean + x*std of inactive factors?
+				double unimportantfactorsmean = 0;
+				for(int i=0; i<thresholdtemp; i++){
+					unimportantfactorsmean += 1.0/thresholdtemp*S_dimless[(int) indexes.getEntry(k-1-i)-1][j]; 	
+				}
+				for(int i=0; i<thresholdtemp; i++){
+					tresholdactive += 1.0/(thresholdtemp-1)*(S_dimless[(int) indexes.getEntry(k-1-i)-1][j]-unimportantfactorsmean)**2; 	
+				}
+				tresholdactive = 3*Math.sqrt(tresholdactive); // TEST/TODO/SET: this determines the threshold. Currently mean+3std of unimportant factors.
+				tresholdactive += unimportantfactorsmean;
+				//println("Thresholdactive (S_xi) " + tresholdactive);
+				int thresholdtemp2 = 0; 
+				double thresholdtempd2 = 1;
+				// find important group
+				while(thresholdtempd2 > tresholdactive){
+					thresholdtempd2 = S_dimless[(int) indexes.getEntry(thresholdtemp2)-1][j];
+					thresholdtemp2++;
+				}
+				int[] importantfactors = new int[(int) Math.max(thresholdtemp2-1,0)]; // While loop continues one loop too much; correct here.
+				for(int i=0; i<thresholdtemp2-1; i++){
+					importantfactors[i] = (int) indexes.getEntry(i);	
+				}
+				printWriter2.printf("%-50s %-30s %n", (String) "(Un)important parameters according to S_xi and threshold h = "+h[hh]+"%", (String) "and output "+ outputs[j]);
+				printWriter2.println("Unimportant: " + Arrays.toString(unimportantfactors));
+				printWriter2.println("Important: " + Arrays.toString(importantfactors));
+				
+				// Based on S_mu
+				// Given output j and threshhold h, determine which paramaters are (un)important. 
+				//int thresholdindex = -1;
+				thresholdtemp = 0; 
+				thresholdtempd = 0;
+				// find unimportant group
+				while(thresholdtempd < 1.0*h[hh]/100){
+					thresholdtempd += S_dimless[(int) indexes2.getEntry(k-1-thresholdtemp)-1][j];
+					thresholdtemp++;
+				}
+				int[] unimportantfactors2 = new int[thresholdtemp];
+				for(int i=0; i<thresholdtemp; i++){
+					unimportantfactors2[i] = (int) indexes2.getEntry(k-1-i);	
+				}
+				tresholdactive = 0; // Mean + x*std of inactive factors?
+				unimportantfactorsmean = 0;
+				for(int i=0; i<thresholdtemp; i++){
+					unimportantfactorsmean += 1.0/thresholdtemp*S_dimless2[(int) indexes2.getEntry(k-1-i)-1][j]; 	
+				}
+				for(int i=0; i<thresholdtemp; i++){
+					tresholdactive += 1.0/(thresholdtemp-1)*(S_dimless2[(int) indexes2.getEntry(k-1-i)-1][j]-unimportantfactorsmean)**2; 	
+				}
+				tresholdactive = 3*Math.sqrt(tresholdactive); // TEST/TODO/SET: this determines the threshold. Currently mean+3std of unimportant factors.
+				tresholdactive += unimportantfactorsmean;
+				//println("Thresholdactive (S_mu) " + tresholdactive);
+				thresholdtemp2 = 0; 
+				thresholdtempd2 = 1;
+				// find important group
+				while(thresholdtempd2 > tresholdactive){
+					thresholdtempd2 = S_dimless2[(int) indexes2.getEntry(thresholdtemp2)-1][j];
+					thresholdtemp2++;
+				}
+				int[] importantfactors2 = new int[(int) Math.max(thresholdtemp2-1,0)]; // While loop continues one loop too much; correct here.
+				for(int i=0; i<thresholdtemp2-1; i++){
+					importantfactors2[i] = (int) indexes2.getEntry(i);	
+				}
+				printWriter2.println();
+				printWriter2.printf("%-50s %-30s %n", (String) "(Un)important parameters according to S_mu and threshold h = "+h[hh]+"%", (String) "and output "+ outputs[j]);
+				printWriter2.println("Unimportant: " + Arrays.toString(unimportantfactors2));
+				printWriter2.println("Important: " + Arrays.toString(importantfactors2));
+				printWriter2.println();
+			}
+		}	
+		printWriter2.close(); 
+	}  
+	
+	/*** ************************ ***/
+	/*** ************************ ***/
+	/*** 	Other				  ***/	
+	/*** ************************ ***/
+	/*** ************************ ***/
+	
+	void elementaryEffectsReadInParamBounds() { 
+		// Read in txt file containing parameters to be taken into account, together with lower and upper bounds, # levels (because boolean/int require different amount than double) and type (double/int/boolean)
+		try
+		{
+			Scanner scanner = new Scanner(new File(inputFileParameters));
+			scanner.nextLine(); // Skip headers
+			int itemp = 0;
+			while(scanner.hasNext()){
+				String[] inputArr = scanner.nextLine().split("\\s+"); // delimiter is any amount of whitespace //split(",");
+				parameterNames.add(inputArr[0]);
+				min.add(Double.parseDouble(inputArr[1])); 
+				max.add(Double.parseDouble(inputArr[2]));
+				ptemp.add(Integer.parseInt(inputArr[3]));
+				typetemp.add(Integer.parseInt(inputArr[4]));
+				cdeltatemp.add(Integer.parseInt(inputArr[5]));
+				itemp++;
+			}
+			scanner.close();
+		}
+		catch(FileNotFoundException e)
+		{
+			println(e.getMessage());
+		}
+		k= parameterNames.size();
+		Delta = MatrixUtils.createRealMatrix(k,1);
+		p = new int[k];
+		type = new int[k];
+		cdelta= new int[k];
+		for(int i=0; i<k; i++){
+			p[i] = (Integer) ptemp.get(i);
+			type[i] = (Integer) typetemp.get(i);
+			cdelta[i] = (Integer) cdeltatemp.get(i);
+			Delta.setEntry(i,0,(double) cdelta[i]/(1.0*(p[i]-1)));
+		}
+		parameterValues = new double[k];
+		println("Num of parameters = " + k + " Num of trajectories " + r);
+	}
+		
+	void elementaryEffectsSetNextParameterPoint(int simnr) { 
+			// Run simulations with correct parameter sets, store outputs
+			// Take B_optimal, which consists of submatrices representing a trajectory, in which each row is a point in parameterspace.
+			//for (int i=0; i<k; i++) {
+				//double[] tempvalue = B_optimal.getRow(simnr);
+				//double[] tempvalue = new double[k];
+				try 
+				{
+					Scanner scanner = new Scanner(new File(inputFileSimulationPoints));
+					for(int i=0; i<simnr; i++){
+						scanner.nextLine();
+					}
+					String[] tempvalue = scanner.nextLine().split("\\s+");
+					//println(Arrays.toString(tempvalue)); 
+					
+				plastochronconst[maize]			= Double.parseDouble(tempvalue[1-1]);	
+				phyllochron[maize]				= Double.parseDouble(tempvalue[2-1]);	
+				finalPhytNum[maize]				= (int) Math.floor(Double.parseDouble(tempvalue[3-1]));	
+				nrShortInternodes[maize]		= (int) Math.floor(Double.parseDouble(tempvalue[4-1]));	
+				wmaxRoot[maize]					= Double.parseDouble(tempvalue[5-1]);	
+				wmaxFlower[maize]				= Double.parseDouble(tempvalue[6-1]);	
+				wmaxInt[maize]					= Double.parseDouble(tempvalue[7-1]);	
+				wmaxLeaf[maize]					= Double.parseDouble(tempvalue[8-1]);	
+				teRoot[maize]					= Double.parseDouble(tempvalue[9-1]);	
+				teFlower[maize]					= Double.parseDouble(tempvalue[10-1]);	
+				teInt[maize]					= Double.parseDouble(tempvalue[11-1]);	
+				teLeaf[maize]					= Double.parseDouble(tempvalue[12-1]);	
+				specificInternodeLength[maize]	= Double.parseDouble(tempvalue[13-1]);	
+				nitro[maize]					= Double.parseDouble(tempvalue[14-1]);	
+				LMA[maize]						= Double.parseDouble(tempvalue[15-1]);	
+				leafLife[maize]					= Double.parseDouble(tempvalue[16-1]);	
+				lwRatio[maize]					= Double.parseDouble(tempvalue[17-1]);	
+				maxWidth[maize]					= Double.parseDouble(tempvalue[18-1]);	
+				shapeCoeff[maize]				= Double.parseDouble(tempvalue[19-1]);	
+				leafAngleLower[maize]			= Double.parseDouble(tempvalue[20-1]);	
+				leafAngleUpper[maize]			= Double.parseDouble(tempvalue[21-1]);	
+				leafCurve[maize]				= Double.parseDouble(tempvalue[22-1]);	
+				petioleFraction[maize]			= Double.parseDouble(tempvalue[23-1]);	
+				specificPetioleLength[maize]	= Double.parseDouble(tempvalue[24-1]);	
+				rankLower[maize]				= (int) Math.floor(Double.parseDouble(tempvalue[25-1]));	
+				phyllotaxisLower[maize]			= Double.parseDouble(tempvalue[26-1]);	
+				varDelay[maize]					= (int) Math.floor(Double.parseDouble(tempvalue[27-1]));	
+				seedMass[maize]					= Double.parseDouble(tempvalue[28-1]);	
+				SASmax							= Double.parseDouble(tempvalue[29-1]);	
+				SASk							= Double.parseDouble(tempvalue[30-1]);	
+				tb[maize]						= Double.parseDouble(tempvalue[31-1]);	
+				fallPAR							= (int) Math.floor(Double.parseDouble(tempvalue[32-1]));	
+				reflectancePAR					= Double.parseDouble(tempvalue[33-1]);	
+				transmittancePAR				= Double.parseDouble(tempvalue[34-1]);	
+				Ca								= Double.parseDouble(tempvalue[35-1]);	
+				VPD								= Double.parseDouble(tempvalue[36-1]);	
+				k2ll_a_SA						= Double.parseDouble(tempvalue[37-1]);	
+				k2ll_b_SA						= Double.parseDouble(tempvalue[38-1]);	
+				Vcmax25_a_SA					= Double.parseDouble(tempvalue[39-1]);	
+				Vcmax25_b_SA					= Double.parseDouble(tempvalue[40-1]);	
+				Jmax25_a_SA						= Double.parseDouble(tempvalue[41-1]);	
+				Jmax25_b_SA						= Double.parseDouble(tempvalue[42-1]);	
+				Rd25_SA							= Double.parseDouble(tempvalue[43-1]);	
+				TPU25_a_SA						= Double.parseDouble(tempvalue[44-1]);	
+				TPU25_b_SA						= Double.parseDouble(tempvalue[45-1]);	
+				rg_SA							= Double.parseDouble(tempvalue[46-1]);	
+				kNkL_SA							= Double.parseDouble(tempvalue[47-1]);	
+				sheathscalefactor				= Double.parseDouble(tempvalue[48-1]);	
+				rm_SA							= Double.parseDouble(tempvalue[49-1]);	
+				fCO2_SA							= Double.parseDouble(tempvalue[50-1]);	
+				tav_a							= Double.parseDouble(tempvalue[51-1]);	
+				tav_b							= Double.parseDouble(tempvalue[52-1]);
+				
+				scanner.close();
+				}
+				catch(FileNotFoundException e)
+				{
+					println(e.getMessage());
+				}
+			//}
+	}
+	
+	int elementaryEffectsGetNrSims() { 
+		//return r*(k+1);
+
+      int lines = 0;
+      try
+		{
+			Scanner scanner = new Scanner(new File(inputFileSimulationPoints));
+			while(scanner.hasNextLine()){
+				lines++;
+				scanner.nextLine();
+			}
+			scanner.close();
+		}
+		catch(FileNotFoundException e)
+		{
+			println(e.getMessage());
+		}
+		//println(lines);
+		return lines;
+	}
